@@ -5,7 +5,7 @@ import pandas as pd
 import json
 import math
 import asyncio
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Union
 from curl_cffi import requests as cureq
 from dscommons.database import Sybase
 from dscommons.vakwerking import Project
@@ -24,14 +24,86 @@ class ImmoScraperAsync:
         self.failed_urls = []
         self.total_scraped = 0
         self.max_pages = 100
-        self.semaphore = asyncio.Semaphore(max_concurrent)  # limit concurrency
+        self.semaphore = asyncio.Semaphore(max_concurrent)
 
     def _get_random_delay(self) -> float:
         base_delay = random.uniform(*self.delay_range)
         jitter = base_delay * 0.2 * random.uniform(-1, 1)
         return max(0.5, base_delay + jitter)
 
+    async def validate_postal_code(self, session: cureq.AsyncSession, post_code: int, city: str) -> bool:
+        """
+        Validate if postal code exists by checking any property type.
+        Returns True if valid, False if invalid.
+        """
+        # Use the first available transaction type and property type for validation
+        first_transaction = list(prop_pc_config.keys())[0]  # 'sale' or 'rent'
+        config = prop_pc_config[first_transaction]
+        base_url = config["url"]
+        first_prop_type = config["prop_types"][0]  # First property type
+        
+        validation_url = base_url.format(first_prop_type, city, post_code, 1)
+        
+        project.log(
+            extra=f"Validating postal code {post_code} ({city}) using URL: {validation_url}",
+            subject="Immoweb scraper",
+            level=logging.INFO,
+        )
+        
+        try:
+            async with self.semaphore:
+                r = await session.get(
+                    validation_url,
+                    impersonate="chrome", 
+                    headers=headers,
+                    cookies=cookies,
+                    timeout=30
+                )
+                
+                if r.status_code == 200:
+                    json_data = json.loads(r.text)
+                    labellized_search = json_data.get("labellizedSearch", "")
+                    
+                    project.log(
+                        extra=f"Validation response for {post_code}: labellizedSearch = '{labellized_search}'",
+                        subject="Immoweb scraper",
+                        level=logging.DEBUG,
+                    )
+                    
+                    # If "Belgium" is in the search, it means the postal code doesn't exist
+                    if "Belgium" in labellized_search:
+                        project.log(
+                            extra=f"INVALID postal code {post_code} ({city}) - redirected to Belgium-wide search",
+                            subject="Immoweb scraper",
+                            level=logging.WARNING,
+                        )
+                        return False
+                    else:
+                        project.log(
+                            extra=f"VALID postal code {post_code} ({city})",
+                            subject="Immoweb scraper",
+                            level=logging.INFO,
+                        )
+                        return True
+                    
+                else:
+                    project.log(
+                        extra=f"Validation failed for {post_code} ({city}) - HTTP {r.status_code}",
+                        subject="Immoweb scraper",
+                        level=logging.WARNING,
+                    )
+                    return False  # Assume invalid if we can't validate
+                    
+        except Exception as e:
+            project.log(
+                extra=f"Error validating postal code {post_code} ({city}): {e}",
+                subject="Immoweb scraper", 
+                level=logging.ERROR,
+            )
+            return False  # Assume invalid on validation error
+
     async def scrape_page(self, session: cureq.AsyncSession, url: str, page_num: int, prop_type: str) -> Optional[pd.DataFrame]:
+        """Scrape a single page and return DataFrame or None if should stop pagination"""
         for attempt in range(self.max_retries):
             try:
                 async with self.semaphore:
@@ -49,18 +121,25 @@ class ImmoScraperAsync:
                     total_items = json_data.get("totalItems")
 
                     if total_items:
-                        self.max_pages = math.ceil(total_items / 30)
+                        self.max_pages = min(math.ceil(total_items / 30), 50)  # Cap at 50 pages
 
                     if not results:
                         project.log(
                             extra=f"No results found for {prop_type} page {page_num}",
                             subject="Immoweb scraper",
-                            level=logging.WARNING,
+                            level=logging.DEBUG,
                         )
-                        return pd.DataFrame()
+                        return pd.DataFrame()  # Empty but valid result
 
                     df = pd.json_normalize(results)
                     self.total_scraped += len(df)
+                    
+                    project.log(
+                        extra=f"Scraped {len(df)} items from {prop_type} page {page_num}",
+                        subject="Immoweb scraper",
+                        level=logging.DEBUG,
+                    )
+                    
                     return df
 
                 elif r.status_code == 429:  # rate limited
@@ -75,12 +154,25 @@ class ImmoScraperAsync:
 
                 elif r.status_code == 404:
                     project.log(
-                        extra=f"Page not found (404) for {prop_type} page {page_num}",
+                        extra=f"Page not found (404) for {prop_type} page {page_num} - stopping pagination",
+                        subject="Immoweb scraper",
+                        level=logging.INFO,
+                    )
+                    return None  # Signal to stop pagination
+
+                else:
+                    project.log(
+                        extra=f"HTTP {r.status_code} for {prop_type} page {page_num}",
                         subject="Immoweb scraper",
                         level=logging.WARNING,
                     )
-                    return None
 
+            except json.JSONDecodeError as e:
+                project.log(
+                    extra=f"JSON decode error for {prop_type} page {page_num}: {e}",
+                    subject="Immoweb scraper",
+                    level=logging.ERROR,
+                )
             except Exception as e:
                 project.log(
                     extra=f"Error scraping {prop_type} page {page_num} (attempt {attempt+1}): {e}",
@@ -89,53 +181,20 @@ class ImmoScraperAsync:
                 )
 
             if attempt < self.max_retries - 1:
-                await asyncio.sleep((2 ** attempt) * random.uniform(1, 3))
+                delay = (2 ** attempt) * random.uniform(1, 3)
+                await asyncio.sleep(delay)
 
+        # All attempts failed
         self.failed_urls.append(url)
+        project.log(
+            extra=f"Failed to scrape {url} after {self.max_retries} attempts",
+            subject="Immoweb scraper",
+            level=logging.ERROR,
+        )
         return pd.DataFrame()
 
-    async def _validate_location(self, session: cureq.AsyncSession, base_url: str, prop_type: str, post_code: int, city: str) -> bool:
-        """Validate if the postal code exists by checking the first page"""
-        url = base_url.format(prop_type, city, post_code, 1)
-        
-        try:
-            async with self.semaphore:
-                r = await session.get(
-                    url,
-                    impersonate="chrome", 
-                    headers=headers,
-                    cookies=cookies,
-                    timeout=30
-                )
-                
-            if r.status_code == 200:
-                json_data = json.loads(r.text)
-                labellized_search = json_data.get("labellizedSearch", "")
-                
-                # If "Belgium" is in the search, it means the postal code doesn't exist
-                if "Belgium" in labellized_search:
-                    project.log(
-                        extra=f"Invalid postal code {post_code} ({city}) - redirected to Belgium-wide search",
-                        subject="Immoweb scraper",
-                        level=logging.WARNING,
-                    )
-                    return False
-                    
-            return True
-            
-        except Exception as e:
-            project.log(
-                extra=f"Error validating location {post_code} ({city}): {e}",
-                subject="Immoweb scraper", 
-                level=logging.ERROR,
-            )
-            return False  # Skip on validation error
-
     async def scrape_all_pages(self, base_url: str, prop_type: str, post_code: int, city: str) -> pd.DataFrame:
-        # Validate location first with separate session
-        async with cureq.AsyncSession() as validation_session:
-            if not await self._validate_location(validation_session, base_url, prop_type, post_code, city):
-                return pd.DataFrame()  # Return empty DataFrame for invalid locations
+        """Scrape all pages for a specific property type (assuming postal code is already validated)"""
         
         project.log(
             extra=f"Starting scrape for {prop_type} in {city} ({post_code}), max {self.max_pages} pages",
@@ -144,21 +203,39 @@ class ImmoScraperAsync:
         )
         
         all_data = []
-        tasks = []
+        consecutive_empty = 0
+        max_consecutive_empty = 2
 
         async with cureq.AsyncSession() as session:
-            for page in range(1, self.max_pages + 1):
+            # Process pages sequentially to handle early stopping logic
+            for page in range(1, min(self.max_pages + 1, 21)):  # Limit to 20 pages max
                 url = base_url.format(prop_type, city, post_code, page)
-                tasks.append(self.scrape_page(session, url, page, prop_type))
-
-            # gather with concurrency control
-            results = await asyncio.gather(*tasks)
-
-        for df in results:
-            if df is None:
-                break
-            if not df.empty:
-                all_data.append(df)
+                
+                df = await self.scrape_page(session, url, page, prop_type)
+                
+                if df is None:  # 404 or similar - stop pagination
+                    project.log(
+                        extra=f"Stopping pagination for {prop_type} at page {page}",
+                        subject="Immoweb scraper",
+                        level=logging.INFO,
+                    )
+                    break
+                
+                if df.empty:
+                    consecutive_empty += 1
+                    if consecutive_empty >= max_consecutive_empty:
+                        project.log(
+                            extra=f"Stopping after {consecutive_empty} consecutive empty pages for {prop_type}",
+                            subject="Immoweb scraper",
+                            level=logging.INFO,
+                        )
+                        break
+                else:
+                    consecutive_empty = 0
+                    all_data.append(df)
+                
+                # Small delay between pages
+                await asyncio.sleep(random.uniform(0.5, 1.5))
 
         total_records = sum(len(df) for df in all_data) if all_data else 0
         project.log(
@@ -179,6 +256,7 @@ async def main(postal_codes: pd.DataFrame, types: List[str] = ["sale", "rent"]):
     
     all_results = []
     all_failed_urls = []
+    skipped_postcodes = []
 
     for idx, row in postal_codes.iterrows():
         post_code = row["Postal Code"]
@@ -190,55 +268,77 @@ async def main(postal_codes: pd.DataFrame, types: List[str] = ["sale", "rent"]):
             level=logging.INFO,
         )
 
+        # STEP 1: Validate postal code once per location
+        scraper = ImmoScraperAsync(delay_range=(0.8, 2.0), max_retries=2, max_concurrent=5)
+        
+        async with cureq.AsyncSession() as validation_session:
+            is_valid = await scraper.validate_postal_code(validation_session, post_code, city)
+        
+        if not is_valid:
+            project.log(
+                extra=f"SKIPPING postal code {post_code} ({city}) - invalid location",
+                subject="Immoweb scraper",
+                level=logging.WARNING,
+            )
+            skipped_postcodes.append({"postal_code": post_code, "city": city, "reason": "invalid_location"})
+            continue  # Skip this entire postal code
+
+        # STEP 2: Scrape all transaction types and property types for this valid postal code
         location_results = []
-        location_invalid = False  # Flag to track if location is invalid
 
         for transaction_type in types:
-            if location_invalid:  # Skip remaining transaction types if location is invalid
-                break
-                
             config = prop_pc_config[transaction_type]
             base_url = config["url"]
             prop_types = config["prop_types"]
 
-            scraper = ImmoScraperAsync(delay_range=(0.8, 2.0), max_retries=2, max_concurrent=5)
+            project.log(
+                extra=f"Processing {transaction_type} for {city} ({post_code})",
+                subject="Immoweb scraper",
+                level=logging.INFO,
+            )
 
-            for prop in prop_types:
+            for prop_type in prop_types:
                 try:
-                    df = await scraper.scrape_all_pages(base_url, prop, post_code, city)
+                    project.log(
+                        extra=f"Scraping {transaction_type} - {prop_type} for {city} ({post_code})",
+                        subject="Immoweb scraper",
+                        level=logging.INFO,
+                    )
                     
-                    if df == "INVALID_LOCATION":
-                        project.log(
-                            extra=f"Skipping postal code {post_code} ({city}) - location not found",
-                            subject="Immoweb scraper",
-                            level=logging.WARNING,
-                        )
-                        location_invalid = True
-                        break  # Break out of property types loop
+                    df = await scraper.scrape_all_pages(base_url, prop_type, post_code, city)
                         
                     if not df.empty:
                         df["scraped_at"] = pd.Timestamp.now().date()
                         df["postal_code"] = post_code
                         df["city"] = city
+                        df["transaction_type"] = transaction_type
+                        df["property_type"] = prop_type
                         location_results.append(df)
 
-                    await asyncio.sleep(random.uniform(1, 3))  # short pause per prop type
+                        project.log(
+                            extra=f"Added {len(df)} records for {transaction_type} - {prop_type}",
+                            subject="Immoweb scraper",
+                            level=logging.INFO,
+                        )
+                    else:
+                        project.log(
+                            extra=f"No results for {transaction_type} - {prop_type}",
+                            subject="Immoweb scraper",
+                            level=logging.INFO,
+                        )
+
+                    await asyncio.sleep(random.uniform(1, 3))  # pause between property types
 
                 except Exception as e:
                     project.log(
-                        extra=f"Error scraping {transaction_type} - {prop}: {e}",
+                        extra=f"Error scraping {transaction_type} - {prop_type}: {e}",
                         subject="Immoweb scraper",
                         level=logging.ERROR,
                     )
 
-                all_failed_urls.extend(scraper.failed_urls)
+            await asyncio.sleep(random.uniform(5, 10))  # pause between transaction types
 
-            await asyncio.sleep(random.uniform(5, 10))  # between transaction types
-
-        # Skip saving if location was invalid
-        if location_invalid:
-            continue
-
+        # STEP 3: Save results for this postal code
         if location_results:
             combined_location_results = pd.concat(location_results, ignore_index=True)
             all_results.append(combined_location_results)
@@ -253,13 +353,18 @@ async def main(postal_codes: pd.DataFrame, types: List[str] = ["sale", "rent"]):
             )
         else:
             project.log(
-                extra=f"No data found for {city} ({post_code})",
+                extra=f"No data found for valid postal code {city} ({post_code})",
                 subject="Immoweb scraper",
                 level=logging.WARNING,
             )
 
-        await asyncio.sleep(random.uniform(5, 15))  # between postcodes
+        # Collect failed URLs
+        all_failed_urls.extend(scraper.failed_urls)
 
+        # Pause between postal codes
+        await asyncio.sleep(random.uniform(10, 20))
+
+    # FINAL RESULTS
     final_results = pd.concat(all_results, ignore_index=True) if all_results else pd.DataFrame()
 
     if not final_results.empty:
@@ -278,6 +383,7 @@ async def main(postal_codes: pd.DataFrame, types: List[str] = ["sale", "rent"]):
             level=logging.WARNING,
         )
 
+    # Save failed URLs
     if all_failed_urls:
         failed_filename = f"{path}/external/failed_urls_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
         pd.DataFrame(all_failed_urls, columns=["failed_url"]).to_csv(failed_filename, index=False)
@@ -288,9 +394,26 @@ async def main(postal_codes: pd.DataFrame, types: List[str] = ["sale", "rent"]):
             level=logging.WARNING,
         )
 
+    # Save skipped postal codes
+    if skipped_postcodes:
+        skipped_filename = f"{path}/external/skipped_postcodes_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        pd.DataFrame(skipped_postcodes).to_csv(skipped_filename, index=False)
+        
+        project.log(
+            extra=f"{len(skipped_postcodes)} invalid postal codes saved to {skipped_filename}",
+            subject="Immoweb scraper",
+            level=logging.WARNING,
+        )
+
+    project.log(
+        extra=f"SUMMARY - Processed: {len(postal_codes)}, Valid: {len(postal_codes) - len(skipped_postcodes)}, Skipped: {len(skipped_postcodes)}, Records: {len(final_results)}",
+        subject="Immoweb scraper",
+        level=logging.INFO,
+    )
+
     return final_results
 
 
 if __name__ == "__main__":
     postcodes = pd.read_csv(f"{path}/external/postcodes.csv")
-    results = asyncio.run(main(postcodes.loc[44:, :], ["sale", "rent"]))
+    results = asyncio.run(main(postcodes.loc[47:, :], ["sale", "rent"]))  
